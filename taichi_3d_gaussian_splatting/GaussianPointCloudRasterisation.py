@@ -198,6 +198,8 @@ def normalize_cov_rotation_in_pointcloud_features(
     pointcloud_features: ti.types.ndarray(ti.f32, ndim=2),  # (N, M)
     point_id: ti.i32,
 ):
+    # 总感觉这个函数可以用 torch 内置函数实现的（指整个并行逻辑）
+    # 可能是需要更细粒度的控制吧
     cov_rotation = ti.math.vec4(
         [pointcloud_features[point_id, offset] for offset in ti.static(range(4))])
     cov_rotation = ti.math.normalize(cov_rotation)
@@ -218,6 +220,7 @@ def load_point_cloud_row_into_gaussian_point_3d(
     cov_scale = ti.math.vec3([pointcloud_features[point_id, offset]
                              for offset in ti.static(range(4, 4 + 3))])
     alpha = pointcloud_features[point_id, 7]
+    # rgb feature 应该是 SH 参数吧？
     r_feature = vec16f([pointcloud_features[point_id, offset]
                        for offset in ti.static(range(8, 8 + 16))])
     g_feature = vec16f([pointcloud_features[point_id, offset]
@@ -261,9 +264,12 @@ def generate_point_attributes_in_camera_plane(  # from 3d gaussian to 2d feature
         camera_intrinsics_mat = ti.Matrix(
             [[camera_intrinsics[row, col] for col in ti.static(range(3))] for row in ti.static(range(3))])
         point_id = point_id_list[idx]
+        # 得到对应 rotation quaternion 的 normalized 表示
         normalize_cov_rotation_in_pointcloud_features(
             pointcloud_features=pointcloud_features,
             point_id=point_id)
+        # 我在想，这些如果全部加载到 taichi end 了，那么梯度怎么保存
+        # position, covariance 以及 RGB SH coeffs 都是有梯度的吧
         gaussian_point_3d = load_point_cloud_row_into_gaussian_point_3d(
             pointcloud=pointcloud,
             pointcloud_features=pointcloud_features,
@@ -276,8 +282,11 @@ def generate_point_attributes_in_camera_plane(  # from 3d gaussian to 2d feature
         T_camera_pointcloud_mat = transform_matrix_from_quaternion_and_translation(
             q=point_q_camera_pointcloud,
             t=point_t_camera_pointcloud,
-        )
+        )       # 变 4 * 4 矩阵
+        # 应该是逆变换 (4 * 4) 矩阵
         T_pointcloud_camera = taichi_inverse_SE3(T_camera_pointcloud_mat)
+        # 为什么 ray origin 是逆变换的 camera translation? 可能需要深入了解 point_t_camera_pointcloud 才知道
+        # 感觉挺怪的，好像求的是相机坐标下，相机的世界移动
         ray_origin = ti.math.vec3(
             [T_pointcloud_camera[0, 3], T_pointcloud_camera[1, 3], T_pointcloud_camera[2, 3]])
 
@@ -302,6 +311,7 @@ def generate_point_attributes_in_camera_plane(  # from 3d gaussian to 2d feature
         ray_direction = gaussian_point_3d.translation - ray_origin
 
         # get color by ray actually only cares about the direction of the ray, ray origin is not used
+        # SH evaluation
         color = gaussian_point_3d.get_color_by_ray(
             ray_origin=ray_origin,
             ray_direction=ray_direction,
@@ -311,6 +321,7 @@ def generate_point_attributes_in_camera_plane(  # from 3d gaussian to 2d feature
         large_eigen_values = (uv_cov[0, 0] + uv_cov[1, 1] +
                               ti.sqrt((uv_cov[0, 0] - uv_cov[1, 1]) * (uv_cov[0, 0] - uv_cov[1, 1]) + 4.0 * uv_cov[0, 1] * uv_cov[1, 0])) / 2.0
         # 3.0 is a value from experiment
+        # 这是什么意思？
         radii = ti.sqrt(large_eigen_values) * 3.0
         point_radii[idx] = radii
 
@@ -826,7 +837,9 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
         self.config = config
 
         class _module_function(torch.autograd.Function):
-
+            # 果然是 forward 重载，不过为什么写成 static method?
+            # taichi 的 `structural binding` 是从什么版本开始支持的？
+            # 外层的输入其实是一个 `GaussianPointCloudRasterisationInput` 类，但在这里可以直接解包
             @staticmethod
             def forward(ctx,
                         pointcloud,
@@ -842,9 +855,16 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                     size=(pointcloud.shape[0],), dtype=torch.int8, device=pointcloud.device)
                 point_id = torch.arange(
                     pointcloud.shape[0], dtype=torch.int32, device=pointcloud.device)
+                # math heavy, 需要对四元数数学有比较好的理解
+                # point cloud 与 camera 之间的相对位姿，需要取逆
+                # 两个位姿是哪来的: point cloud 是由 colmap 计算的 global frame 下的 point cloud
+                # 假设我们认为 point cloud 定义了一个坐标系，那么实际上 camera_pointcloud (我没看相对关系)
+                # 可以认为是不同 camera 相对 pointcloud 系的位姿变换
                 q_camera_pointcloud, t_camera_pointcloud = inverse_SE3_qt_torch(
                     q=q_pointcloud_camera, t=t_pointcloud_camera)
                 # Step 1: filter points
+                # filter point 的意义是什么？做 frustum culling 吗？ 确实，做视锥剔除了，会返回一个 point_in_camera_mask
+                # 表示某个点是否可以被某相机观测到
                 filter_point_in_camera(
                     pointcloud=pointcloud,
                     point_invalid_mask=point_invalid_mask,
@@ -861,29 +881,38 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                 point_in_camera_mask = point_in_camera_mask.bool()
 
                 # Get id based on the camera_mask
+                # torch 端，取出所有可以被 camera 看见的点，并将结果 tensor 连续化（形成一个连续的 tensor）
                 point_id_in_camera_list = point_id[point_in_camera_mask].contiguous(
                 )
                 del point_id
                 del point_in_camera_mask
-
+                # delete 之后，内存释放但是 GPU 占用还在吧。为的是此部分显存可被 cudaMalloc 复用？
                 # Number of points in camera
                 num_points_in_camera = point_id_in_camera_list.shape[0]
 
                 # Allocate memory
+                # uv 是什么？Gaussian rasterize 之后的像素坐标？
                 point_uv = torch.empty(
                     size=(num_points_in_camera, 2), dtype=torch.float32, device=pointcloud.device)
                 point_alpha_after_activation = torch.empty(
                     size=(num_points_in_camera,), dtype=torch.float32, device=pointcloud.device)
+                # 真正在 camera 内部的3D点位置？
                 point_in_camera = torch.empty(
                     size=(num_points_in_camera, 3), dtype=torch.float32, device=pointcloud.device)
+                
+                # TODO: 这个变量是用来做什么的，目前还不知道
                 point_uv_conic_and_rescale = torch.empty(
                     size=(num_points_in_camera, 4), dtype=torch.float32, device=pointcloud.device)
+
                 point_color = torch.zeros(
                     size=(num_points_in_camera, 3), dtype=torch.float32, device=pointcloud.device)
+
+                # TODO: isotropic Guassian 才有半径这一说吧？所以难道这个变量是给初始化 Gaussian 用的？
                 point_radii = torch.empty(
                     size=(num_points_in_camera,), dtype=torch.float32, device=pointcloud.device)
 
                 # Step 2: get 2d features
+                # TODO: 这一步就直接开始进行 3D 到 2D 的 Gaussian 投影了？ 这么快？我前面的 Gaussian 还是 isotropic 的呢
                 generate_point_attributes_in_camera_plane(
                     pointcloud=pointcloud,
                     pointcloud_features=pointcloud_features,

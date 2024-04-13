@@ -116,11 +116,13 @@ class GaussianPointCloudTrainer:
         return image, resized_camera_info
 
     def train(self):
+        # torch 和 Taichi 之间的相互 porting 本身就是支持的，不过我自己没有这么用过，所以会觉得有意思
         ti.init(arch=ti.cuda, device_memory_GB=0.1, kernel_profiler=self.config.enable_taichi_kernel_profiler) # we don't use taichi fields, so we don't need to allocate memory, but taichi requires the memory to be allocated > 0
         train_data_loader = torch.utils.data.DataLoader(
             self.train_dataset, batch_size=None, shuffle=True, pin_memory=True, num_workers=4)
         val_data_loader = torch.utils.data.DataLoader(
             self.val_dataset, batch_size=None, shuffle=False, pin_memory=True, num_workers=4)
+        # TODO: 这是创建了一个迭代器吗？python 这边迭代器语法我用得特别少
         train_data_loader_iter = cycle(train_data_loader)
         
         optimizer = torch.optim.Adam(
@@ -140,7 +142,7 @@ class GaussianPointCloudTrainer:
                 downsample_factor = downsample_factor // 2
             optimizer.zero_grad()
             position_optimizer.zero_grad()
-            
+            # 确实是个 python 迭代器，但我在想，自己手写的迭代器会不会没有 torch 原生迭代器的 prefetch 以及 multiple worker 功能？
             image_gt, q_pointcloud_camera, t_pointcloud_camera, camera_info = next(
                 train_data_loader_iter)
             if downsample_factor > 1:
@@ -162,6 +164,7 @@ class GaussianPointCloudTrainer:
                 t_pointcloud_camera=t_pointcloud_camera,
                 color_max_sh_band=iteration // self.config.increase_color_max_sh_band_interval,
             )
+            # 这里直接 rasterize 了，self.rasterisation 可以直接当 forward 调用？在哪重载的 call？
             image_pred, image_depth, pixel_valid_point_count = self.rasterisation(
                 gaussian_point_cloud_rasterisation_input)
             # clip to [0, 1]
