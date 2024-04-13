@@ -142,6 +142,7 @@ def generate_point_sort_key_by_num_overlap_tiles(
     camera_height: ti.i32,
     depth_to_sort_key_scale: ti.f32,
 ):
+    # 还是 range for 先遍历所有的 Gaussian
     for point_offset in range(accumulated_num_overlap_tiles.shape[0]):
         uv = ti.math.vec2([point_uv[point_offset, 0],
                            point_uv[point_offset, 1]])
@@ -158,6 +159,10 @@ def generate_point_sort_key_by_num_overlap_tiles(
         point_depth = xyz_in_camera[2]
         encoded_projected_depth = ti.cast(
             point_depth * depth_to_sort_key_scale, ti.i32)
+        # 现在需要真正用上被覆盖的   tile u, v
+        # 并且由于此函数是并行的，这要求我们首先将 accumulated_num_overlap_tiles 算出来
+        # Taichi 没有 warp 或者 block 级别的 barrier
+        # cumsum 操作也不方便并行实现（因为是前后线程相互依赖，并且不满足交换律） 
         for tile_u in range(min_tile_u, max_tile_u):
             for tile_v in range(min_tile_v, max_tile_v):
                 overlap_tiles_count = (max_tile_v - min_tile_v) * \
@@ -166,10 +171,20 @@ def generate_point_sort_key_by_num_overlap_tiles(
                     overlap_tiles_count
                 encoded_tile_id = ti.cast(
                     tile_u + tile_v * (camera_width // TILE_WIDTH), ti.i32)
+                # 用一个 i64, 高32位保存 tile 信息，低32为保存投影深度信息、
+                # depth_to_sort_key_scale 是写在 config 文件中的一个scale, 相当于一种量化吧
+                # 因为我们最后希望使用整个 key 进行排序，如果是浮点的话，浮点排序是有别于整型的，所以
+                # 需要转成可以排序的量化后 int，相当于定点数
                 sort_key = ti.cast(encoded_projected_depth, ti.i64) + \
                     (ti.cast(encoded_tile_id, ti.i64) << 32)
                 point_in_camera_sort_key[key_idx] = sort_key
                 point_offset_with_sort_key[key_idx] = point_offset
+
+                # 这里的存储方式相当于这样：假设 id = 0 的高斯覆盖了 2 * 3 个 tile, id = 1
+                # 覆盖了 3 * 3 个 tile, 则上面的循环（如果处理的是 0)，会在 point_in_camera_sort_key
+                # (与 total tile num 大小一致) 中填上下面六个位置 并且会在 point_offset_with_sort_key、
+                # 中记录，每个 tile 是从哪一个 point 中出来的
+                # [0] [] [] [] [] [] [] [1] [] [] [] [] [] [] [] []
 
 
 @ti.kernel
@@ -321,7 +336,8 @@ def generate_point_attributes_in_camera_plane(  # from 3d gaussian to 2d feature
         large_eigen_values = (uv_cov[0, 0] + uv_cov[1, 1] +
                               ti.sqrt((uv_cov[0, 0] - uv_cov[1, 1]) * (uv_cov[0, 0] - uv_cov[1, 1]) + 4.0 * uv_cov[0, 1] * uv_cov[1, 0])) / 2.0
         # 3.0 is a value from experiment
-        # 这是什么意思？
+        # 这是什么意思？ 文章貌似使用了如下方法: 找到 Gaussian 的 max eigen value, 并用如下方法当投影高斯的范围
+        # 则投影高斯实际上会被当成具有一个 bounding circle, bounding circle 用于 判断其与哪些 tile 重合
         radii = ti.sqrt(large_eigen_values) * 3.0
         point_radii[idx] = radii
 
@@ -378,6 +394,9 @@ def gaussian_point_rasterisation(
         valid_point_count: ti.i32 = 0
 
         # open the shared memory
+        # Taichi 现在允许使用 shared Memeory 了？学习一下... 挺牛的
+        # 感觉这算是真正有设计思想的 11 * 256 * 4，充足的 shared memory
+        # TILE_HEIGHT = TILE_WIDTH 使得一个 block 有 256 threads, 也很合理
         tile_point_uv = ti.simt.block.SharedArray(
             (2, ti.static(TILE_WIDTH * TILE_HEIGHT)), dtype=ti.f32)
         tile_point_uv_conic_and_rescale = ti.simt.block.SharedArray(
@@ -392,7 +411,15 @@ def gaussian_point_rasterisation(
         num_points_in_tile = end_offset - start_offset
         num_point_groups = (num_points_in_tile + ti.static(TILE_WIDTH *
                             TILE_HEIGHT - 1)) // ti.static(TILE_WIDTH * TILE_HEIGHT)
+        # 这里分 group 是为了做什么？为什么不直接全部遍历？ 而且还要保证向上取整？
+        # 要把这个 kernel 看成一个 CUDA kernel，此 kernel 包含 TILE_WIDTH * TILE_HEIGHT 个 threads
+        # 我估计是，比如一共有 x 个 Gaussian tile 在这个 tile 中，假设有 256 个线程，那么线程 0
+        # 将会处理 0, 0 + 256, 0 + 256 + 256, ... 等等这些 Gaussian 的 splatting
+        # 所以实际上不是一个线程处理一个像素！因为我们根本不知道这个线程（对应的像素）会与哪个 Gaussian 有关系
+        # 一个线程处理一个像素，这还是[光线追踪的想法！]，光栅化应该是一个线程对应一个 primitive
+        # 这样，即便一个 tile 内的 primitive 数量大于线程数，也可以处理（循环嘛）
         pixel_saturated = False
+        # 这里的注释明显也有直接循环，为什么不这样？
         # for idx_point_offset_with_sort_key in range(start_offset, end_offset):
         for point_group_id in range(num_point_groups):
             # The original implementation uses a predicate block the next update for shared memory until all threads finish the current update
@@ -403,14 +430,17 @@ def gaussian_point_rasterisation(
             if tile_saturated != 0:
                 break
             """
+            # 感觉直接 sync 好像确实没有什么不可以的
             ti.simt.block.sync()
             # load point data into shared memory
             # [start_offset, end_offset)->[0, end_offset - start_offset)
+            # 看吧，一下步进 TILE_SIZE 个 primitive，推理非常正确奥
             to_load_idx_point_offset_with_sort_key = start_offset + \
                 point_group_id * \
                 ti.static(TILE_WIDTH * TILE_HEIGHT) + thread_id
             if to_load_idx_point_offset_with_sort_key < end_offset:
                 to_load_point_offset = point_offset_with_sort_key[to_load_idx_point_offset_with_sort_key]
+                # 这些是要大量复用的吗？
                 tile_point_uv[0, thread_id] = point_uv[to_load_point_offset, 0]
                 tile_point_uv[1, thread_id] = point_uv[to_load_point_offset, 1]
                 tile_point_uv_conic_and_rescale[0, thread_id] = point_uv_conic_and_rescale[to_load_point_offset, 0]
@@ -420,17 +450,26 @@ def gaussian_point_rasterisation(
                 if not rgb_only:
                     tile_point_depth[thread_id] = point_in_camera[to_load_point_offset, 2]
                 tile_point_alpha[thread_id] = point_alpha_after_activation[to_load_point_offset]
-
+                # color / uv 这些，是已经在 3D 转 2D 这一步就算好的（包括 SH 的 evaluation）
                 tile_point_color[0,
                                  thread_id] = point_color[to_load_point_offset, 0]
                 tile_point_color[1,
                                  thread_id] = point_color[to_load_point_offset, 1]
                 tile_point_color[2,
                                  thread_id] = point_color[to_load_point_offset, 2]
-
+            # 后面相当于是 fragment shader 了
+            # 前面是 vertex shader
             ti.simt.block.sync()
             max_point_group_offset: ti.i32 = ti.min(
                 ti.static(TILE_WIDTH * TILE_HEIGHT), num_points_in_tile - point_group_id * ti.static(TILE_WIDTH * TILE_HEIGHT))
+            # 这里是在做什么？ point_group_id 是指本thread正在处理 point_group 中的第几个（注意一个thread处理若干个 Gaussian）
+            # 这个循环本来应该做着色的，但如果是要给一个 tile 内（确实是在着色），但社这里的逻辑有点不那么直接明了
+            # 我大概懂了。这里本来有两种实现方法：(1) 每一个线程只处理一个 primitive 的着色，也即这个 primitive 直接在整个
+            # tile 内，对每个像素的 RGB 贡献都算出来，累加到最后的 buffer 上。这样最为 straightforward 以及 intuitive (因为本大循环就是)
+            # 每个 thread 处理自己的 point_group_id 对应的 primitive, 但这样不是一个高效的实现
+            # 因为这样要跨 thread 通信。所以最好的实现是: 每个线程首先把当前 group 的所有信息都装到共享内存中
+            # 之后，每个线程，针对自己的 pixel，做 shading。这是真正的 fragment shader (带 alpha blending 操作)
+            # 如果我早一点看代码搞懂 GS 的原理，在腾讯二面的时候讲光栅化的例子就可以好好地介绍一下这个了。当时介绍的比较笼统
             for point_group_offset in range(max_point_group_offset):
                 if pixel_saturated:
                     break
@@ -438,7 +477,7 @@ def gaussian_point_rasterisation(
                 idx_point_offset_with_sort_key: ti.i32 = start_offset + \
                     point_group_id * \
                     ti.static(TILE_WIDTH * TILE_HEIGHT) + point_group_offset
-
+                # 下面的流程就不用多说了，相当于根据 vertex 信息去做插值，只不过这个插值是自定义插值，而不是真的“插值”
                 uv = ti.math.vec2(
                     [tile_point_uv[0, point_group_offset], tile_point_uv[1, point_group_offset]])
                 uv_conic_and_rescale = ti.math.vec4([tile_point_uv_conic_and_rescale[0, point_group_offset],
@@ -454,6 +493,7 @@ def gaussian_point_rasterisation(
                     gaussian_mean=uv,
                     conic_and_rescale=uv_conic_and_rescale,
                 )
+                # 做 alpha blending 了
                 alpha = gaussian_alpha * point_alpha_after_activation_value
                 # from paper: we skip any blending updates with 𝛼 < 𝜖 (we choose 𝜖 as 1
                 # 255 ) and also clamp 𝛼 with 0.99 from above.
@@ -470,6 +510,8 @@ def gaussian_point_rasterisation(
                     pixel_saturated = True
                     continue  # somehow faster than directly breaking
                 offset_of_last_effective_point = idx_point_offset_with_sort_key + 1
+                # 最后的结果保存在 local register 中，很快速，一个 thread 也只需要考虑 local shading 结果
+                # 不涉及到 atomicAdd (必然串行化) 以及 thread 间通信问题
                 accumulated_color += color * alpha * T_i
 
                 if not rgb_only:
@@ -486,6 +528,9 @@ def gaussian_point_rasterisation(
         rasterized_image[pixel_v, pixel_u, 0] = accumulated_color[0]
         rasterized_image[pixel_v, pixel_u, 1] = accumulated_color[1]
         rasterized_image[pixel_v, pixel_u, 2] = accumulated_color[2]
+
+        # 剩下这些可以解释为，color buffer 之外的 buffer 进行数据填充。在 real time rendering 里面叫什么来着？
+        # multi-pass rendering? 一次 vertex shader 操作之后，fragment shader 可以进行不同信息的计算
         if not rgb_only:
             rasterized_depth[pixel_v, pixel_u] = accumulated_depth / \
                 ti.max(depth_normalization_factor, 1e-6)
@@ -495,7 +540,12 @@ def gaussian_point_rasterisation(
             pixel_valid_point_count[pixel_v, pixel_u] = valid_point_count
     # end of pixel loop
 
-
+# Backward 属实有点恶心，这个段时间内可能看不明白
+# 需要另找时间仔细研究: 因为这真的是要对对应参数进行 backward 操作的
+# 目前我还不是特别清楚 torch 里面的反向传播链式求导是怎么做的
+# 大概是这样吧，所以如果是正则化项，dL / dI 这一段不需要我们求，torch 自动求了
+# 如果是加在 alpha 上的惩罚，可能也不需要写梯度操作
+# dL / dI * dI / d {theta}
 @ti.kernel
 def gaussian_point_rasterisation_backward(
     camera_height: ti.i32,
@@ -930,6 +980,8 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                 )
 
                 # Step 3: get how many tiles overlapped, in order to allocate memory
+                # 通过圆，求一个方型 bounding box, bounding box 将与不同的 tile 相交、
+                # 这里只是求每一个 gaussian 与多少个 tile 相交（这有什么用？难道用于后续的分配内存？）
                 num_overlap_tiles = torch.empty_like(point_id_in_camera_list)
                 generate_num_overlap_tiles(
                     num_overlap_tiles=num_overlap_tiles,
@@ -946,6 +998,7 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                 else:
                     total_num_overlap_tiles = 0
                 # The space of each point.
+                # 可能真是如上所说，这里相当于把每个 Gaussian 所交 tile 的起始 index 算出来了，上面的 cumsum 得到的还不是 index
                 accumulated_num_overlap_tiles = torch.cat(
                     (torch.zeros(size=(1,), dtype=torch.int32, device=pointcloud.device),
                      accumulated_num_overlap_tiles[:-1]))
@@ -960,6 +1013,7 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                     size=(total_num_overlap_tiles,), dtype=torch.int32, device=pointcloud.device)
 
                 # Step 4: calclualte key
+                # 这里的 key 是什么？意思难道是高斯在每一个 tile 上的投影深度？因为我们要靠投影深度来排序？
                 if point_in_camera_sort_key.shape[0] > 0:
                     generate_point_sort_key_by_num_overlap_tiles(
                         point_uv=point_uv,
@@ -973,7 +1027,14 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                         depth_to_sort_key_scale=self.config.depth_to_sort_key_scale,
                     )
 
+                # 所以最后，是所有 tile 一起sort（这也太大了，怎么做到的？）
+                # 个人估计 GPU sort 要么就是分块并行然后合并
+                # 要么就是桶排序？不太清楚具体怎么做
                 point_in_camera_sort_key, permutation = point_in_camera_sort_key.sort()
+                # 由于tile id 小的高位也小，所以总的顺序是：小 tile id 先，大 tile id 后，同一 tile id 看深度
+                # 这样就会出现: 不同的 Gaussian,覆盖到同一tile的，按深度排序，接下来则是用同一排序 permutation
+                # 把每个 tile 记录的 tile-gaussian point mapping 给映射了一遍，保证了我们可以在需要的时候
+                # 使用对应的 Gaussian Point，并且对应 point 还是按深度记录了的
                 point_offset_with_sort_key = point_offset_with_sort_key[permutation].contiguous(
                 )  # now the point_offset_with_sort_key is sorted by the sort_key
                 del permutation
@@ -985,6 +1046,11 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
                 tile_points_end = torch.zeros(size=(
                     tiles_per_row * tiles_per_col,), dtype=torch.int32, device=pointcloud.device)
                 # Find tile's start and end.
+                # 所以接下来这一步，相当于是要算两个和 tiled image 这么大的图
+                # 分别求，在 point_offset_with_sort_key 中，对应到某一个 tile 的起始与终止 index
+                # 相当于 tile_points_start[i] 存了 在 point_offset_with_sort_key 中，位于 i tile 的第一个 Point 位置
+                # tile_points_end[i] 存了 在 point_offset_with_sort_key 中，位于 i tile 的最后一个 Point 位置（+1？是否+1我不知道）
+                # 那么 find 的时候，实际上还需要通过 point_in_camera_sort_key，取出高32位判断
                 if point_in_camera_sort_key.shape[0] > 0:
                     find_tile_start_and_end(
                         point_in_camera_sort_key=point_in_camera_sort_key,
@@ -1007,6 +1073,9 @@ class GaussianPointCloudRasterisation(torch.nn.Module):
 
                 # Step 5: render
                 if point_in_camera_sort_key.shape[0] > 0:
+                    # 这一步 render 本来感觉可以直接用 torch 的 tensor 去完成
+                    # 但很可能，由于不同 tile 的 Gaussian 数量根本不同，所以 tensor 并行还是很难完成，所以仍然需要借助 Taichi
+                    # 此时 backward 则需要自己写（不过可以不用 CUDA）
                     gaussian_point_rasterisation(
                         camera_height=camera_info.camera_height,
                         camera_width=camera_info.camera_width,
